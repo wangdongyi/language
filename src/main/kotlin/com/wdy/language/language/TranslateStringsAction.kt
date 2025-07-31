@@ -16,6 +16,10 @@ import java.nio.file.Files
 import java.nio.file.Paths
 import javax.swing.*
 import javax.swing.table.DefaultTableModel
+import javax.xml.transform.OutputKeys
+import javax.xml.transform.TransformerFactory
+import javax.xml.transform.dom.DOMSource
+import javax.xml.transform.stream.StreamResult
 
 class TranslateStringsAction : AnAction() {
 
@@ -338,6 +342,9 @@ private fun saveStringsToProject(
             .newDocumentBuilder()
             .parse(file)
 
+        // 清除空白文本节点，防止多余换行
+        removeWhitespaceNodes(document)
+
         val nodes = document.getElementsByTagName("string")
         val updatedStrings = updatedData.associateBy({ it[0] }, { it })
 
@@ -362,13 +369,33 @@ private fun saveStringsToProject(
         }
 
         // 保存修改后的内容到文件
-        val transformer = javax.xml.transform.TransformerFactory.newInstance().newTransformer()
-        transformer.setOutputProperty(javax.xml.transform.OutputKeys.INDENT, "yes")
-        val source = javax.xml.transform.dom.DOMSource(document)
-        val result = javax.xml.transform.stream.StreamResult(file)
+//        val transformer = javax.xml.transform.TransformerFactory.newInstance().newTransformer()
+//        transformer.setOutputProperty(javax.xml.transform.OutputKeys.INDENT, "yes")
+//        val source = javax.xml.transform.dom.DOMSource(document)
+//        val result = javax.xml.transform.stream.StreamResult(file)
+//        transformer.transform(source, result)
+        val transformer = TransformerFactory.newInstance().newTransformer()
+        transformer.setOutputProperty(OutputKeys.INDENT, "yes")
+        transformer.setOutputProperty("{http://xml.apache.org/xslt}indent-amount", "4")
+
+        val source = DOMSource(document)
+        val result = StreamResult(file)
         transformer.transform(source, result)
     }
 
+}
+
+// 移除所有空白文本节点，防止换行保留
+private fun removeWhitespaceNodes(node: Node) {
+    val children = node.childNodes
+    for (i in children.length - 1 downTo 0) {
+        val child = children.item(i)
+        if (child.nodeType == Node.TEXT_NODE && child.textContent.trim().isEmpty()) {
+            node.removeChild(child)
+        } else if (child.hasChildNodes()) {
+            removeWhitespaceNodes(child)
+        }
+    }
 }
 
 

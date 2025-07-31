@@ -6,7 +6,7 @@ plugins {
 }
 
 group = "com.wdy.language"
-version = "1.2.0-WDY"
+version = "1.3.0-WDY"
 
 repositories {
     mavenCentral()
@@ -54,7 +54,7 @@ tasks {
     }
 
     patchPluginXml {
-        sinceBuild.set("241")
+        sinceBuild.set("193")
         untilBuild.set("259.*")
     }
 
