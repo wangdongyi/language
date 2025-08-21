@@ -6,6 +6,7 @@ import com.intellij.openapi.fileChooser.FileChooserDescriptor
 import com.intellij.openapi.fileChooser.FileChooserFactory
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
+import org.apache.poi.ss.usermodel.Cell
 import org.apache.poi.ss.usermodel.Row
 import org.apache.poi.ss.usermodel.WorkbookFactory
 import org.w3c.dom.Element
@@ -20,9 +21,10 @@ import javax.xml.transform.OutputKeys
 import javax.xml.transform.TransformerFactory
 import javax.xml.transform.dom.DOMSource
 import javax.xml.transform.stream.StreamResult
+import org.apache.poi.xssf.usermodel.XSSFWorkbook  // Apache POI 的 Excel 2007+ 工作簿
+import java.io.FileOutputStream
 
 class TranslateStringsAction : AnAction() {
-
     override fun actionPerformed(event: AnActionEvent) {
         val project = event.project
         if (project == null) {
@@ -30,24 +32,18 @@ class TranslateStringsAction : AnAction() {
             return
         }
 
-        // 第一步：用户选择 Excel 文件
         val selectedFile = chooseExcelFile(project) ?: return
 
         try {
-            // 第二步：解析 Excel 文件
             parseExcelFile(selectedFile) { excelData ->
                 if (excelData.isEmpty()) {
                     Messages.showErrorDialog("在所选的 Excel 文件中未找到有效数据，请检查表格。", "错误")
                     return@parseExcelFile
                 }
 
-                // 第三步：读取 Android 工程中的 strings.xml 文件
                 val stringsData = readStringsFromProject(project)
-
-                // 第四步：合并数据
                 val mergedData = mergeExcelWithStrings(excelData, stringsData)
 
-                // 第五步：显示表格并允许编辑（回到 UI 线程）
                 SwingUtilities.invokeLater {
                     showEditableTableWithSaveButton(
                         project,
@@ -68,14 +64,14 @@ class TranslateStringsAction : AnAction() {
 private fun chooseExcelFile(project: Project): File? {
     val descriptor = FileChooserDescriptor(true, false, false, false, false, false)
     descriptor.withFileFilter { it.name.endsWith(".xlsx") || it.name.endsWith(".xls") }
-
     val virtualFile =
         FileChooserFactory.getInstance().createFileChooser(descriptor, project, null).choose(project).firstOrNull()
     return virtualFile?.canonicalPath?.let { File(it) }
 }
 
-private fun parseExcelFile(file: File, callback: (List<List<String>>) -> Unit) {
-    val result = mutableListOf<List<String>>()
+// -------------------- Excel 解析 --------------------
+private fun parseExcelFile(file: File, callback: (Map<String, List<String>>) -> Unit) {
+    val result = mutableMapOf<String, MutableList<String>>() // key=中文, value=翻译行
 
     val loadingDialog = JDialog().apply {
         title = "加载中..."
@@ -85,25 +81,20 @@ private fun parseExcelFile(file: File, callback: (List<List<String>>) -> Unit) {
         layout = BorderLayout()
         add(JLabel("正在读取 Excel 文件，请稍候..."), BorderLayout.CENTER)
     }
-    // 显示 loading 弹窗
     loadingDialog.isVisible = true
-    val worker = object : SwingWorker<List<List<String>>, Void>() {
-        override fun doInBackground(): List<List<String>> {
+
+    val worker = object : SwingWorker<Map<String, List<String>>, Void>() {
+        override fun doInBackground(): Map<String, List<String>> {
             try {
                 WorkbookFactory.create(file).use { workbook ->
                     for (sheetIndex in 0 until workbook.numberOfSheets) {
                         val sheet = workbook.getSheetAt(sheetIndex)
-                        println("正在读取 Sheet: ${sheet.sheetName}")
                         if (sheet.physicalNumberOfRows == 0) continue
-                        // 试着从第 0 行找标题，如果没有再从第 1 行找
+
                         val headerRow: Row? = sheet.getRow(0)?.takeIf { it.physicalNumberOfCells > 0 }
                             ?: sheet.getRow(1)?.takeIf { it.physicalNumberOfCells > 0 }
+                        if (headerRow == null) continue
 
-                        if (headerRow == null) {
-                            println("跳过没有有效标题行的 sheet: ${sheet.sheetName}")
-                            continue
-                        }
-                        // 找到标题行
                         val headerRowIndex = headerRow.rowNum
                         val titleIndexMap = mutableMapOf<String, Int>()
                         for (cell in headerRow) {
@@ -118,27 +109,30 @@ private fun parseExcelFile(file: File, callback: (List<List<String>>) -> Unit) {
                                 title.contains("法文") -> titleIndexMap["fr"] = cell.columnIndex
                             }
                         }
-
                         val zhIndex = titleIndexMap["zh"] ?: continue
 
-                        // 添加数据行
                         for (rowIndex in (headerRowIndex + 1) until sheet.physicalNumberOfRows) {
                             val row = sheet.getRow(rowIndex) ?: continue
-                            val zhText = row.getCell(zhIndex)?.toString()?.trim()
-                            if (zhText.isNullOrEmpty()) continue
+                            val zhCell = row.getCell(zhIndex)
+                            val zhText = zhCell?.toString()?.trim()
+                            if (zhText.isNullOrEmpty() || isStrikethrough(zhCell)) continue
 
-                            val rowData = mutableListOf<String>()
-                            rowData.add(zhText) // 中文
+                            val rowData = result.getOrPut(zhText) { mutableListOf(zhText, "", "", "", "", "", "") }
 
-                            // 添加英文到法文的翻译
                             val langOrder = listOf("en", "ru", "ar", "es", "pt", "fr")
-                            for (lang in langOrder) {
+                            for ((langIdx, lang) in langOrder.withIndex()) {
                                 val colIndex = titleIndexMap[lang]
-                                val value = colIndex?.let { row.getCell(it)?.toString()?.trim() } ?: ""
-                                rowData.add(value)
-                            }
+                                val value = if (colIndex != null) {
+                                    val cell = row.getCell(colIndex)
+                                    if (isStrikethrough(cell)) "" else cell?.toString()?.trim() ?: ""
+                                } else ""
 
-                            result.add(rowData)
+                                // 只有非空值才覆盖
+                                if (value.isNotEmpty()) {
+                                    rowData[langIdx + 1] = value
+                                }
+                            }
+                            result[zhText] = rowData
                         }
                     }
                 }
@@ -159,10 +153,41 @@ private fun parseExcelFile(file: File, callback: (List<List<String>>) -> Unit) {
             }
         }
     }
-
     worker.execute()
 }
 
+// -------------------- 合并逻辑 --------------------
+private fun mergeExcelWithStrings(
+    excelData: Map<String, List<String>>,
+    stringsData: Map<String, Map<String, String>>
+): List<List<String>> {
+    val merged = mutableListOf<List<String>>()
+
+    val header = listOf("Name", "Chinese", "English", "Russian", "Arabic", "Spanish", "Portuguese", "French")
+    merged.add(header)
+
+    for ((name, translations) in stringsData) {
+        val mergedRow = mutableListOf<String>()
+        mergedRow.add(name)
+
+        val defaultValue = translations["default"] ?: ""
+        mergedRow.add(defaultValue)
+
+        val excelRow = excelData[defaultValue]
+
+        mergedRow.add(excelRow?.getOrNull(1) ?: translations["en"] ?: "")
+        mergedRow.add(excelRow?.getOrNull(2) ?: translations["ru"] ?: "")
+        mergedRow.add(excelRow?.getOrNull(3) ?: translations["ar"] ?: "")
+        mergedRow.add(excelRow?.getOrNull(4) ?: translations["es"] ?: "")
+        mergedRow.add(excelRow?.getOrNull(5) ?: translations["pt"] ?: "")
+        mergedRow.add(excelRow?.getOrNull(6) ?: translations["fr"] ?: "")
+
+        merged.add(mergedRow)
+    }
+    return merged
+}
+
+// -------------------- 其他工具方法 --------------------
 private fun readStringsFromProject(project: Project): Map<String, Map<String, String>> {
     val stringsMap = mutableMapOf<String, MutableMap<String, String>>()
     val virtualFiles = Files.walk(Paths.get(project.basePath ?: ""))
@@ -180,12 +205,8 @@ private fun readStringsFromProject(project: Project): Map<String, Map<String, St
             val documentBuilder = javax.xml.parsers.DocumentBuilderFactory.newInstance()
                 .newDocumentBuilder()
             val document = documentBuilder.parse(file)
-
             val root = document.documentElement
-            if (root == null || root.nodeName != "resources") {
-                println("跳过非资源文件：${file.name}")
-                continue
-            }
+            if (root == null || root.nodeName != "resources") continue
 
             val locale = getLocaleFromPath(filePath.toString())
             val nodes = document.getElementsByTagName("string")
@@ -195,10 +216,7 @@ private fun readStringsFromProject(project: Project): Map<String, Map<String, St
                 val value = node.textContent
                 stringsMap.computeIfAbsent(name) { mutableMapOf() }[locale] = value
             }
-
-        } catch (e: Exception) {
-            println("跳过无法解析的文件：${file.name} (${e.message})")
-        }
+        } catch (_: Exception) {}
     }
     return stringsMap
 }
@@ -209,62 +227,12 @@ private fun getLocaleFromPath(path: String): String {
     return match?.groupValues?.get(1) ?: "default"
 }
 
-
-private fun mergeExcelWithStrings(
-    excelData: List<List<String>>,
-    stringsData: Map<String, Map<String, String>>
-): List<List<String>> {
-    val merged = mutableListOf<List<String>>()
-
-    // 添加表头
-    val header = listOf("Name", "Chinese", "English", "Russian", "Arabic", "Spanish", "Portuguese", "French")
-    merged.add(header)
-
-    // 遍历 stringsData 中的每个 name
-    for ((name, translations) in stringsData) {
-        val mergedRow = mutableListOf<String>()
-        mergedRow.add(name) // 第一列：显示 name
-
-        // 获取 default 语言的 value
-        val defaultValue = translations["default"] ?: ""
-        mergedRow.add(defaultValue) // 第二列：显示 default 语言的 value
-
-        // 遍历 Excel 数据，查找匹配的中文
-        for (row in excelData) {
-            if (row.isEmpty()) continue // 跳过空行
-            val excelChinese = row[0] // Excel 中的中文
-            // 如果 Excel 中的中文与 default 语言的 value 相同
-            if (excelChinese == defaultValue) {
-                // 将 Excel 中的翻译放入对应的国家翻译列中
-                mergedRow.add(row.getOrNull(1) ?: translations["en"] ?: "") // English
-                mergedRow.add(row.getOrNull(2) ?: translations["ru"] ?: "") // Russian
-                mergedRow.add(row.getOrNull(3) ?: translations["ar"] ?: "") // Arabic
-                mergedRow.add(row.getOrNull(4) ?: translations["es"] ?: "") // Spanish
-                mergedRow.add(row.getOrNull(5) ?: translations["pt"] ?: "") // Portuguese
-                mergedRow.add(row.getOrNull(6) ?: translations["fr"] ?: "") // French
-                break // 找到匹配项后跳出循环
-            }
-        }
-        merged.add(mergedRow)
-    }
-    return merged
-}
-
-
-private fun showExcelDataInTable(data: List<List<String>>, title: String) {
-    val frame = JFrame(title)
-    val tableModel = DefaultTableModel()
-    for (column in data[0]) {
-        tableModel.addColumn(column)
-    }
-    for (row in data.drop(1)) {
-        tableModel.addRow(row.toTypedArray())
-    }
-    val table = JTable(tableModel)
-    table.isEnabled = false // Make it non-editable
-    frame.add(JScrollPane(table))
-    frame.setSize(800, 600)
-    frame.isVisible = true
+private fun isStrikethrough(cell: Cell?): Boolean {
+    if (cell == null) return false
+    val workbook = cell.sheet.workbook
+    val style = cell.cellStyle ?: return false
+    val font = workbook.getFontAt(style.fontIndexAsInt)
+    return font.strikeout
 }
 
 private fun showEditableTableWithSaveButton(
@@ -276,21 +244,21 @@ private fun showEditableTableWithSaveButton(
     val frame = JFrame(title)
     frame.layout = BorderLayout()
 
-    // 创建表格模型
     val tableModel = DefaultTableModel()
     for (column in data[0]) {
-        tableModel.addColumn(column) // 添加表头
+        tableModel.addColumn(column)
     }
     for (row in data.drop(1)) {
-        tableModel.addRow(row.toTypedArray()) // 添加每一行数据
+        tableModel.addRow(row.toTypedArray())
     }
 
-    // 创建表格
     val table = JTable(tableModel)
     val scrollPane = JScrollPane(table)
 
-    // 创建保存按钮
+    val buttonPanel = JPanel() // 按钮区域
     val saveButton = JButton("保存修改")
+    val exportButton = JButton("保存为Excel")
+
     saveButton.addActionListener {
         val updatedData = mutableListOf<List<String>>()
         for (i in 0 until tableModel.rowCount) {
@@ -300,7 +268,7 @@ private fun showEditableTableWithSaveButton(
             }
             updatedData.add(row)
         }
-        saveAction(updatedData) // 将修改后的数据传给保存逻辑
+        saveAction(updatedData)
         JOptionPane.showMessageDialog(
             frame,
             "修改内容已保存到 string.xml！",
@@ -308,10 +276,65 @@ private fun showEditableTableWithSaveButton(
             JOptionPane.INFORMATION_MESSAGE
         )
     }
+// 导出为 Excel
+    exportButton.addActionListener {
+        val chooser = JFileChooser()
+        chooser.dialogTitle = "选择保存路径"
+        chooser.fileSelectionMode = JFileChooser.FILES_ONLY
+        val result = chooser.showSaveDialog(frame)
+        if (result == JFileChooser.APPROVE_OPTION) {
+            val file = chooser.selectedFile
+            try {
+                val workbook = XSSFWorkbook()
+                val sheet = workbook.createSheet("Translations")
 
-    // 布局
+
+// 写表头
+                val headerRow = sheet.createRow(0)
+                for (j in 0 until tableModel.columnCount) {
+                    headerRow.createCell(j).setCellValue(tableModel.getColumnName(j))
+                }
+
+
+// 写数据
+                for (i in 0 until tableModel.rowCount) {
+                    val row = sheet.createRow(i + 1)
+                    for (j in 0 until tableModel.columnCount) {
+                        row.createCell(j).setCellValue(tableModel.getValueAt(i, j)?.toString() ?: "")
+                    }
+                }
+
+
+                val targetFile = if (file.name.endsWith(".xlsx")) file else File(file.absolutePath + ".xlsx")
+                FileOutputStream(targetFile).use { fos ->
+                    workbook.write(fos)
+                }
+                workbook.close()
+
+
+                JOptionPane.showMessageDialog(
+                    frame,
+                    "Excel 文件已保存到: ${targetFile.absolutePath}",
+                    "保存成功",
+                    JOptionPane.INFORMATION_MESSAGE
+                )
+            } catch (ex: Exception) {
+                JOptionPane.showMessageDialog(
+                    frame,
+                    "保存 Excel 失败: ${ex.message}",
+                    "错误",
+                    JOptionPane.ERROR_MESSAGE
+                )
+                ex.printStackTrace()
+            }
+        }
+    }
+
+
+    buttonPanel.add(saveButton)
+    buttonPanel.add(exportButton)
     frame.add(scrollPane, BorderLayout.CENTER)
-    frame.add(saveButton, BorderLayout.SOUTH)
+    frame.add(buttonPanel, BorderLayout.SOUTH)
     frame.setSize(800, 600)
     frame.isVisible = true
 }
@@ -333,7 +356,6 @@ private fun saveStringsToProject(
         }
         .toList()
 
-    // 遍历每个 strings.xml 文件，更新翻译内容
     for (filePath in stringsFiles) {
         val file = filePath.toFile()
         val locale = getLocaleFromPath(filePath.toString())
@@ -341,8 +363,6 @@ private fun saveStringsToProject(
         val document = javax.xml.parsers.DocumentBuilderFactory.newInstance()
             .newDocumentBuilder()
             .parse(file)
-
-        // 清除空白文本节点，防止多余换行
         removeWhitespaceNodes(document)
 
         val nodes = document.getElementsByTagName("string")
@@ -368,24 +388,15 @@ private fun saveStringsToProject(
             }
         }
 
-        // 保存修改后的内容到文件
-//        val transformer = javax.xml.transform.TransformerFactory.newInstance().newTransformer()
-//        transformer.setOutputProperty(javax.xml.transform.OutputKeys.INDENT, "yes")
-//        val source = javax.xml.transform.dom.DOMSource(document)
-//        val result = javax.xml.transform.stream.StreamResult(file)
-//        transformer.transform(source, result)
         val transformer = TransformerFactory.newInstance().newTransformer()
         transformer.setOutputProperty(OutputKeys.INDENT, "yes")
         transformer.setOutputProperty("{http://xml.apache.org/xslt}indent-amount", "4")
-
         val source = DOMSource(document)
         val result = StreamResult(file)
         transformer.transform(source, result)
     }
-
 }
 
-// 移除所有空白文本节点，防止换行保留
 private fun removeWhitespaceNodes(node: Node) {
     val children = node.childNodes
     for (i in children.length - 1 downTo 0) {
@@ -397,7 +408,3 @@ private fun removeWhitespaceNodes(node: Node) {
         }
     }
 }
-
-
-
-
