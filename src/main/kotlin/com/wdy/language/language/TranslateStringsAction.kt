@@ -98,6 +98,10 @@ private fun parseExcelFile(file: File, callback: (Map<String, List<String>>) -> 
                         val headerRowIndex = headerRow.rowNum
                         val titleIndexMap = mutableMapOf<String, Int>()
                         for (cell in headerRow) {
+                            val colIndex = cell.columnIndex
+                            // 列被隐藏不读取
+                            if (sheet.isColumnHidden(colIndex)) continue
+
                             val title = cell.toString()
                             when {
                                 title.contains("文言") -> titleIndexMap["zh"] = cell.columnIndex

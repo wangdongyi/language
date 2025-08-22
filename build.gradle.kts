@@ -6,7 +6,7 @@ plugins {
 }
 
 group = "com.wdy.language"
-version = "1.5.0-WDY"
+version = "1.6.0-WDY"
 
 repositories {
     mavenCentral()
